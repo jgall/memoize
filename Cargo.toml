@@ -22,6 +22,7 @@ syn = { version = "1.0", features = ["full"] }
 
 lru = { version = "0.6", optional = true }
 async-lock = { version = "2.7.0", optional = true }
+futures = "0.3.27"
 
 [features]
 default = ["full"]

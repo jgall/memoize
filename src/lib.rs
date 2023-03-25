@@ -261,16 +261,6 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
     let lock = quote::quote! {
         &mut #store_ident.lock()#await_or_unwrap
     };
-    let lock_and_get = if sig.asyncness.is_none() {
-        quote::quote! {
-            let mut hm = &mut #lock;
-            let r = #get_and_await;
-        }
-    } else {
-        quote::quote! {
- 
-        }
-    };
     #[cfg(feature = "full")]
     let memoizer = {
         let options: store::CacheOptions = syn::parse(attr.clone().into()).unwrap();
@@ -387,7 +377,7 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
                         None => {}
                     }
                     let mut subject = Subject::new_empty();
-                    hm.#insert_fn(#syntax_names_tuple, Left(subject.clone()));
+                    hm.#insert_fn(#syntax_names_tuple_cloned, Left(subject.clone()));
                     let mut subject = subject.inner.lock().await;
                     drop(hm);
                     let r = #get_and_await;
