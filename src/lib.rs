@@ -1,10 +1,11 @@
 #![crate_type = "proc-macro"]
 #![allow(unused_imports)] // Spurious complaints about a required trait import.
 
+use lazy_static::__Deref;
 use syn::{self, parse_macro_input, spanned::Spanned, ItemFn};
 
 use proc_macro::TokenStream;
-use quote::{self, ToTokens};
+use quote::{self, ToTokens, TokenStreamExt};
 
 // This implementation of the storage backend does not depend on any more crates.
 #[cfg(not(feature = "full"))]
@@ -221,11 +222,22 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Construct storage for the memoized keys and return values.
     let store_ident = syn::Ident::new(&map_name.to_uppercase(), sig.span());
-    let (cache_type, cache_init) = store::construct_cache(&attr, input_tuple_type, return_type);
+    let mod_ident = syn::Ident::new(&map_name.to_lowercase(),sig.span());
+    let cache_return_type = if sig.asyncness.is_some() {
+        quote::quote! { #mod_ident::Either<#mod_ident::Subject<#return_type>, #return_type> }
+    } else {
+        return_type
+    };
+    let (cache_type, cache_init) = store::construct_cache(&attr, input_tuple_type, cache_return_type);
+    let mutex_type = if sig.asyncness.is_some() {
+        quote::quote! { async_lock::Mutex }
+    } else {
+        quote::quote! { std::sync::Mutex }
+    };
     let store = quote::quote! {
         lazy_static::lazy_static! {
-            static ref #store_ident : std::sync::Mutex<#cache_type> =
-                std::sync::Mutex::new(#cache_init);
+            static ref #store_ident : #mutex_type<#cache_type> =
+            #mutex_type::new(#cache_init);
         }
     };
 
@@ -238,59 +250,200 @@ pub fn memoize(attr: TokenStream, item: TokenStream) -> TokenStream {
     let syntax_names_tuple = quote::quote! { (#(#input_names),*) };
     let syntax_names_tuple_cloned = quote::quote! { (#(#input_names.clone()),*) };
     let (insert_fn, get_fn) = store::cache_access_methods(&attr);
+    let (do_await, await_or_unwrap) = if sig.asyncness.is_some() {
+        (quote::quote! { .await }, quote::quote! { .await })
+    } else {
+        (quote::quote! {}, quote::quote! { .unwrap() })
+    };
+    let get_and_await = quote::quote! {
+        #memoized_id(#(#input_names.clone()),*)#do_await
+    };
+    let lock = quote::quote! {
+        &mut #store_ident.lock()#await_or_unwrap
+    };
+    let lock_and_get = if sig.asyncness.is_none() {
+        quote::quote! {
+            let mut hm = &mut #lock;
+            let r = #get_and_await;
+        }
+    } else {
+        quote::quote! {
+ 
+        }
+    };
     #[cfg(feature = "full")]
     let memoizer = {
         let options: store::CacheOptions = syn::parse(attr.clone().into()).unwrap();
-        match options.time_to_live {
-            None => quote::quote! {
+        match (options.time_to_live, sig.asyncness.is_some()) {
+            (None, false) => quote::quote! {
                 #sig {
                     {
-                        let mut hm = &mut #store_ident.lock().unwrap();
+                        let mut hm = #lock;
                         if let Some(r) = hm.#get_fn(&#syntax_names_tuple_cloned) {
                             return r.clone();
                         }
                     }
-                    let r = #memoized_id(#(#input_names.clone()),*);
-                    let mut hm = &mut #store_ident.lock().unwrap();
+                    let r = #get_and_await;
+                    let mut hm = #lock;
                     hm.#insert_fn(#syntax_names_tuple, r.clone());
                     r
                 }
             },
-            Some(ttl) => quote::quote! {
+            (None, true) => quote::quote! {
+                #sig {
+                    use #mod_ident::{Subject, Either::{Left, Right}};
+                    let r = {
+                        let mut hm = #lock;
+                        match hm.#get_fn(&#syntax_names_tuple_cloned) {
+                            Some(Left(subject)) => {
+                                let subject = subject.clone();
+                                drop(hm);
+                                return subject.get().await.unwrap().clone()
+                            },
+                            Some(Right(r)) => return r.clone(),
+                            None => {},
+                        }
+                        let subject = Subject::new_empty();
+                        hm.#insert_fn(#syntax_names_tuple_cloned, Left(subject.clone()));
+                        let mut subject = subject.inner.lock().await;
+                        drop(hm);
+                        let r = #get_and_await;
+                        *subject = Some(r.clone());
+                        drop(subject);
+                        r
+                    };
+                    let mut hm = #lock;
+                    hm.#insert_fn(#syntax_names_tuple, Right(r.clone()));
+                    r
+                }
+            },
+            (Some(ttl), false) => quote::quote! {
                 #sig {
                     {
-                        let mut hm = &mut #store_ident.lock().unwrap();
+                        let mut hm = #lock;
                         if let Some((last_updated, r)) = hm.#get_fn(&#syntax_names_tuple_cloned) {
                             if last_updated.elapsed() < #ttl {
                                 return r.clone();
                             }
                         }
                     }
-                    let r = #memoized_id(#(#input_names.clone()),*);
-                    let mut hm = &mut #store_ident.lock().unwrap();
+                    let r = #get_and_await;
+                    let mut hm = #lock;
                     hm.#insert_fn(#syntax_names_tuple, (std::time::Instant::now(), r.clone()));
+                    r
+                }
+            },
+            (Some(ttl), true) => quote::quote! {
+                #sig {
+                    use #mod_ident::{Subject, Either::{Left, Right}};
+                    let r = {
+                        let mut hm = #lock;
+                        match hm.#get_fn(&#syntax_names_tuple_cloned) {
+                            Some((last_updated, r)) => {
+                                if last_updated.elapsed() < #ttl {
+                                    match r {
+                                        Left(subject) => {
+                                            let subject = subject.clone()
+                                            drop(hm);
+                                            return subject.get().await.unwrap().clone()
+                                        }
+                                        Right(r) => return r.clone()
+                                    }
+                                }
+                            },
+                            None => {}
+                        }
+                        let mut subject = Subject::new_empty();
+                        hm.#insert_fn(#syntax_names_tuple, Left(subject.clone()));
+                        let mut subject = subject.inner.lock().await;
+                        // We've now inserted a subject into the map, and we've locked the subject, so we can unlock the map now
+                        drop(hm);
+                        r = #get_and_await;
+                        *subject = Some(r.clone());
+                        drop(subject);
+                        r
+                    };
+                    let mut hm = #lock;
+                    hm.#insert_fn(#syntax_names_tuple, Right(r.clone()));
                     r
                 }
             },
         }
     };
     #[cfg(not(feature = "full"))]
-    let memoizer = quote::quote! {
-        #sig {
-            {
-                let mut hm = &mut #store_ident.lock().unwrap();
-                if let Some(r) = hm.#get_fn(&#syntax_names_tuple_cloned) {
-                    return r.clone();
-                }
+    let memoizer = if sig.asyncness.is_some() {
+        quote::quote! {
+            #sig {
+                use #mod_ident::{Subject, Either::{Left, Right}};
+                let r = {
+                    let mut hm = #lock;
+                    match hm.#get_fn(&#syntax_names_tuple_cloned) {
+                        Some(Left(subject)) => {
+                            let subject = subject.clone();
+                            drop(hm);
+                            return subject.get().await.unwrap().clone()
+                        },
+                        Some(Right(r)) => return r.clone(),
+                        None => {}
+                    }
+                    let mut subject = Subject::new_empty();
+                    hm.#insert_fn(#syntax_names_tuple, Left(subject.clone()));
+                    let mut subject = subject.inner.lock().await;
+                    drop(hm);
+                    let r = #get_and_await;
+                    *subject = Some(r.clone());
+                    drop(subject);
+                    r
+                };
+                let mut hm = #lock;
+                hm.#insert_fn(#syntax_names_tuple, Right(r.clone()));
+                r
             }
-            let r = #memoized_id(#(#input_names.clone()),*);
-            let mut hm = &mut #store_ident.lock().unwrap();
-            hm.#insert_fn(#syntax_names_tuple, r.clone());
-            r
+        }
+    } else { 
+        quote::quote! {
+            #sig {
+                {
+                    let mut hm = &mut #lock;
+                    if let Some(r) = hm.#get_fn(&#syntax_names_tuple_cloned) {
+                        return r.clone();
+                    }
+                }
+                let r = #get_and_await;
+                let mut hm = &mut #lock;
+                hm.#insert_fn(#syntax_names_tuple, r.clone());
+                r
+            }
         }
     };
 
     (quote::quote! {
+        mod #mod_ident {
+            use std::sync::{Mutex, Arc};
+            #[derive(Clone)]
+            pub struct Subject<T> {
+                pub inner: Arc<async_lock::Mutex<Option<T>>>
+            }
+
+            #[derive(Clone)]
+            pub enum Either<X: Clone, Y: Clone> {
+                Left(X),
+                Right(Y),
+            }
+
+            impl<T: Clone> Subject<T> {
+                pub fn new_empty() -> Self {
+                    Self {
+                        inner: Arc::new(async_lock::Mutex::new(None))
+                    }
+                }
+
+                pub async fn get(&self) -> Option<T> {
+                    self.inner.lock().await.clone()
+                }
+            }
+        }
+
         #store
 
         #renamed_fn

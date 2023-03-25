@@ -21,7 +21,9 @@ quote = "1.0"
 syn = { version = "1.0", features = ["full"] }
 
 lru = { version = "0.6", optional = true }
+async-lock = { version = "2.7.0", optional = true }
 
 [features]
-default = []
-full = ["lru"]
+default = ["full"]
+full = ["lru", "async"]
+async = ["async-lock"]
